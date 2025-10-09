@@ -123,9 +123,7 @@ end
 
 
 
-% for ii= 1:length(TX_path_type_vec),
-% for ii= 1:3,
-for ii= 4:6,
+for ii= 1:length(TX_path_type_vec),
     %build a parmeter set
     parms.tgt = tgt;
     parms.TX_path_type = TX_path_type_vec(ii);
