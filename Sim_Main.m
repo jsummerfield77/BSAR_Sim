@@ -1,4 +1,77 @@
-%Sim_Main.m
+% Sim_Main.m
+% Author: John Summerfield
+%
+% Description:
+% This script is the main driver for the bistatic SAR simulation framework. 
+% It represents a major update to the simulation originally developed as part 
+% of my Ph.D. dissertation research at UMass Dartmouth. The current version 
+% modernizes the underlying physics assumptions from a traditional 
+% move–stop–move model to a constant fast-time velocity model, enabling 
+% accurate modeling of continuous platform motion and Doppler effects, 
+% especially in high-speed scenarios.
+%
+% Physics Model Update:
+% - Previous versions assumed the radar platform stopped during each pulse 
+%   (move–stop–move), an approximation valid only for relatively low-speed 
+%   systems.
+% - The updated model assumes constant platform velocity during fast time. 
+%   At any given moment in slow time, the scattering signal from every point 
+%   target in the scene is modeled as:
+%       • Doppler-time scaled by: η = (c + RR) / (c - RR)
+%       • Fast-time delayed by:   delay = Bistatic_Range / c
+%   where RR is the bistatic range rate and Bistatic_Range is the instantaneous 
+%   bistatic distance from transmitter to target to receiver. This continuous 
+%   motion model captures Doppler evolution accurately and is essential for 
+%   high-velocity platforms.
+%
+% Platform and Geometry Modeling:
+% - Generates closed-form expressions for platform position and velocity vectors.
+% - Computes line-of-sight (LOS) unit vectors from both transmitter and receiver 
+%   platforms to the scene center as functions of slow time.
+% - Derives time derivatives of LOS vectors to obtain closed-form expressions of:
+%     • Bistatic range gradient vector
+%     • Range rate gradient vector
+%     • Range rate rate gradient vector
+%
+% Sampling and Resolution Design:
+% - Establishes Nyquist sampling requirements based on scene size, slow-time 
+%   aperture duration, and waveform bandwidth.
+% - Determines slow-time sampling intervals and frequency-domain resolution to 
+%   meet specified spatial resolution goals.
+%
+% K-Space Transfer Function Synthesis:
+% - Constructs Fourier-domain (K-space) representations of the SAR transfer 
+%   function (TF).
+% - Designs agile waveform frequency parameters to reshape the TF passband 
+%   support region in K-space for optimized imaging performance.
+% - Implements frequency-dependent weighting functions to tailor system response 
+%   characteristics.
+%
+% Waveform and Frequency Agility:
+% - Uses a stepped-frequency waveform and varies the frequency sweep strategy to 
+%   achieve frequency agility and passband control.
+%
+% Simulation and Image Formation:
+% - Simulates raw SAR data (phase history) from a synthetic scene containing 
+%   point targets, incorporating the full bistatic geometry and Doppler-time 
+%   scaling.
+% - Generates point spread functions (PSFs) and impulse responses (IPRs) from 
+%   the simulated data.
+% - Forms matched-filtered SAR images directly from GPU-accelerated phase 
+%   history data using CUDA.
+%
+% Performance Metrics:
+% - Computes impulse response (IPR) metrics, including:
+%     • Spatial resolution
+%     • Peak sidelobe ratio (PSLR)
+%     • Integrated sidelobe ratio (ISLR)
+%
+% Notes:
+% This script is optimized for execution on NVIDIA GPUs to enable large-scale 
+% simulations of high-speed bistatic SAR scenarios with agile waveform control. 
+% The combination of closed-form modeling, K-space shaping, and GPU acceleration 
+% enables rapid exploration of waveform strategies and their impact on SAR image 
+% quality and ambiguity performance.
 function Sim_Main(dataFileName, parms)
 
 device = gpuDevice(1);    
@@ -484,12 +557,40 @@ RRGrad_fun = @(tau) [RRGrad_fun_x(tau);RRGrad_fun_y(tau);RRGrad_fun_z(tau)];
 RRGrad_GP_fun = @(tau) [RRGrad_fun_x(tau);RRGrad_fun_y(tau);zeros(size(tau))];
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-fc_fm_fun = @(tau) fc*RGrad_GP_mag_fun(0)./RGrad_GP_mag_fun(tau);
-BW_fm_fun = @(tau) BW*RGrad_GP_mag_fun(0)./RGrad_GP_mag_fun(tau);
+RRRGrad_fun_x = @(tau) (RRGrad_fun_x(tau + eps*1e6)-RRGrad_fun_x(tau))/(eps*1e6);
+RRRGrad_fun_y = @(tau) (RRGrad_fun_y(tau + eps*1e6)-RRGrad_fun_y(tau))/(eps*1e6);
+RRRGrad_fun_z = @(tau) (RRGrad_fun_z(tau + eps*1e6)-RRGrad_fun_z(tau))/(eps*1e6);
+RRRGrad_fun = @(tau) [RRRGrad_fun_x(tau);RRRGrad_fun_y(tau);RRRGrad_fun_z(tau)];
+
+RRRGrad_GP_fun = @(tau) [RRRGrad_fun_x(tau);RRRGrad_fun_y(tau);zeros(size(tau))];
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+Mod_vec_fun_x = @(tau) RGrad_fun_x(tau) +2*(Range_fun_TX(tau)+Range_fun_RX(tau)).*RRGrad_fun_x(tau)/c_sol;
+Mod_vec_fun_y = @(tau) RGrad_fun_y(tau) +2*(Range_fun_TX(tau)+Range_fun_RX(tau)).*RRGrad_fun_y(tau)/c_sol;
+% Mod_vec_fun_z = @(tau) RGrad_fun_z(tau) +2*(Range_fun_TX(tau)+Range_fun_RX(tau))*RRGrad_fun_z(tau)/c_sol;
+Mod_vec_fun_z = @(tau) zeros(size(tau));
+Mod_vec_fun = @(tau) [Mod_vec_fun_x(tau);Mod_vec_fun_y(tau);Mod_vec_fun_z(tau)];
+Mod_vec_mag_fun = @(tau) sqrt(dot(Mod_vec_fun(tau),Mod_vec_fun(tau),1)); 
+
+
+d_Mod_vec_fun_x = @(tau) (Mod_vec_fun_x(tau+eps*1e6)-Mod_vec_fun_x(tau))/(eps*1e6);
+d_Mod_vec_fun_y = @(tau) (Mod_vec_fun_y(tau+eps*1e6)-Mod_vec_fun_y(tau))/(eps*1e6);
+d_Mod_vec_fun_z = @(tau) (Mod_vec_fun_z(tau+eps*1e6)-Mod_vec_fun_z(tau))/(eps*1e6);
+d_Mod_vec_fun = @(tau) [d_Mod_vec_fun_x(tau);d_Mod_vec_fun_y(tau);d_Mod_vec_fun_z(tau)];
+
+display('Update this');
+% fc_fm_fun = @(tau) fc*RGrad_GP_mag_fun(0)./RGrad_GP_mag_fun(tau);
+% BW_fm_fun = @(tau) BW*RGrad_GP_mag_fun(0)./RGrad_GP_mag_fun(tau);
+
+fc_fm_fun = @(tau) fc*Mod_vec_mag_fun(0)./Mod_vec_mag_fun(tau);
+BW_fm_fun = @(tau) BW*Mod_vec_mag_fun(0)./Mod_vec_mag_fun(tau);
 
 %These might be wrong
-d_fc_fm_fun = @(tau) -fc*RGrad_GP_mag_fun(0)*d_RGrad_GP_mag_fun(tau).*RGrad_GP_mag_fun(tau).^(-2);
-d_BW_fm_fun = @(tau) -BW*RGrad_GP_mag_fun(0)*d_RGrad_GP_mag_fun(tau).*RGrad_GP_mag_fun(tau).^(-2);
+% d_fc_fm_fun = @(tau) -fc*RGrad_GP_mag_fun(0)*d_RGrad_GP_mag_fun(tau).*RGrad_GP_mag_fun(tau).^(-2);
+% d_BW_fm_fun = @(tau) -BW*RGrad_GP_mag_fun(0)*d_RGrad_GP_mag_fun(tau).*RGrad_GP_mag_fun(tau).^(-2);
+
+d_fc_fm_fun = @(tau) (fc_fm_fun(tau+eps*1e6)-fc_fm_fun(tau))/(eps*1e6);
+d_BW_fm_fun = @(tau) (BW_fm_fun(tau+eps*1e6)-BW_fm_fun(tau))/(eps*1e6);
 
 % d_fc_fm_fun = @(tau) fc*RGrad_GP_mag_fun(0)*d_RGrad_GP_mag_fun(tau)./(RGrad_GP_mag_fun(tau).^2);
 % d_BW_fm_fun = @(tau) BW*RGrad_GP_mag_fun(0)*d_RGrad_GP_mag_fun(tau)./(RGrad_GP_mag_fun(tau).^2);
@@ -626,6 +727,22 @@ RRGrad_z = RRGrad_fun_z(t);
 RRGrad   = RRGrad_fun(t);
 RRGrad_GP= RRGrad_GP_fun(t);
 
+%%%%
+RRRGrad_x = RRRGrad_fun_x(t);
+RRRGrad_y = RRRGrad_fun_y(t);
+RRRGrad_z = RRRGrad_fun_z(t);
+RRRGrad   = RRRGrad_fun(t);
+RRRGrad_GP= RRRGrad_GP_fun(t);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+Range_TX = Range_fun_TX(t);
+Range_RX = Range_fun_RX(t);
+Bi_Range = Range_TX + Range_RX;
+
+RRange_TX = -dot(Vel_TX,LOS_TX,1);
+RRange_RX = -dot(Vel_RX,LOS_RX,1);
+Bi_RRange = RRange_TX + RRange_RX;
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %This is just for showing the flight paths for a much longer flight time
 %than when the SAR image is being displaced.
@@ -710,106 +827,36 @@ POS_RX2 = POS_fun_RX(t2);
 %K-space
 k_const = 2*pi/c_sol;
 
-% F_x = k_const*freq.'*RGrad_fun_x(t); 
-% F_y = k_const*freq.'*RGrad_fun_y(t); 
-% F_z = k_const*freq.'*RGrad_fun_z(t); 
-%Just project to the ground plane- only XY plane image
-%Come back to this when we do InSAR and 3D SAR
+%Move-stop-Move
+% F_x = k_const*freq_mesh.*(ones(N_f,1)*RGrad_x);
+% F_y = k_const*freq_mesh.*(ones(N_f,1)*RGrad_y);
 % F_z = zeros(N_f,N_t);
 
-% surf_F_fun_x = @(v,tau) k_const*v.'*RGrad_fun_x(tau);
-% surf_F_fun_y = @(v,tau) k_const*v.'*RGrad_fun_y(tau);
-% surf_F_fun_z = @(v,tau) k_const*v.'*zeros(size(tau));
-
-% surf_Ft_fun_x = @(v,tau) k_const*v.'*RRGrad_fun_x(tau);
-% surf_Ft_fun_y = @(v,tau) k_const*v.'*RRGrad_fun_y(tau);
-% surf_Ft_fun_z = @(v,tau) k_const*v.'*zeros(size(tau));
-
-% surf_Ff_fun_x = @(v,tau) k_const*ones(size(v)).'*RGrad_fun_x(tau);
-% surf_Ff_fun_y = @(v,tau) k_const*ones(size(v)).'*RGrad_fun_y(tau);
-% surf_Ff_fun_z = @(v,tau) k_const*ones(size(v)).'*zeros(size(tau));
-
-
-F_x = k_const*freq_mesh.*(ones(N_f,1)*RGrad_x);
-F_y = k_const*freq_mesh.*(ones(N_f,1)*RGrad_y);
+%Const Fast-Time Vel
+F_x = k_const*freq_mesh.*(ones(N_f,1)*(RGrad_x + 2*Bi_Range.*RRGrad_x/c_sol));
+F_y = k_const*freq_mesh.*(ones(N_f,1)*(RGrad_y + 2*Bi_Range.*RRGrad_y/c_sol));
 F_z = zeros(N_f,N_t);
 
-% F_x = surf_F_fun_x(freq,t);
-% F_y = surf_F_fun_y(freq,t);
-% F_z = surf_F_fun_z(freq,t);
-
 %%%%
-G_x = k_const*freq_fm_mesh.*(ones(N_f,1)*RGrad_x);
-G_y = k_const*freq_fm_mesh.*(ones(N_f,1)*RGrad_y);
-G_z = zeros(N_f,N_t);
-
-% G_x = zeros(N_f,N_t);
-% G_y = zeros(N_f,N_t);
+%Move-stop-Move
+% G_x = k_const*freq_fm_mesh.*(ones(N_f,1)*RGrad_x);
+% G_y = k_const*freq_fm_mesh.*(ones(N_f,1)*RGrad_y);
 % G_z = zeros(N_f,N_t);
 
-% Gf_x = zeros(N_f,N_t);
-% Gf_y = zeros(N_f,N_t);
-% Gf_z = zeros(N_f,N_t);
-
-% Gt_x = zeros(N_f,N_t);
-% Gt_y = zeros(N_f,N_t);
-% Gt_z = zeros(N_f,N_t);
-
-%f is absolute frequency
-%\vec{F}(f,t) = k_const*f*\vec{\nabla R}(t)
-%\vec{F}_t(f,t) = \frac{\partial}{\partial t}\vec{F}(f,t) = k_const*f*\vec{\nabla \dot{R}}(t)
-%\vec{F}_f(f,t) = \frac{\partial}{\partial f}\vec{F}(f,t) = k_const*\vec{\nabla R}(t)
-
-%v is relative frequency, absolute frequency f = f_c(t)+v
-%\vec{G}(v,t) = \vec{F}(f_c(t) + v,t)  
-
-%\vec{G}_t(v,t) = \frac{\partial}{\partial t}\vec{G}(v,t) 
-%= \vec{F}_t(f_c(t) + v,t)+ f'_c(t)\vec{F}_f(f_c(t) + v,t)
-
-%\vec{G}_v(v,t) = \frac{\partial}{\partial v}\vec{G}(v,t) 
-%= \vec{F}_f(f_c(t) + v,t)
-% for ii=1:N_t,    
-%     G_x(:,ii) = surf_F_fun_x(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-%     G_y(:,ii) = surf_F_fun_y(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-% 
-%     %set it to zeros
-%     % G_z(:,ii) = surf_F_fun_z(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-% 
-%     %\vec{G}(v,t) = k_const*(f_c(t)+v)*\vec{\nabla R}(t)
-% 
-%     %\vec{G}_v(v,t) = \frac{\partial }{\partial v} \vec{G}(v,t)
-%     %= k_const*\vec{\nabla R}(t)
-%     %=\vec{F}_f(f,t)
-% 
-% 
-%     Gf_x(:,ii) = surf_Ff_fun_x(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-%     Gf_y(:,ii) = surf_Ff_fun_y(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-%     % Gf_z(:,ii) = surf_Ff_fun_z(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-% 
-%     %\vec{G}(v,t) = k_const*(f_c(t)+v)*\vec{\nabla R}(t)
-%     %\vec{G}_t(v,t) = \frac{\partial}{\partial t} \vec{G}(v,t) 
-%     %=k_const*f'_c(t)*\vec{\nabla R}(t) + k_const*(f_c(t)+v)*\vec{\nabla \dot{R}}(t)
-%     %=f'_c(t)*\vec{F}_f(v,t) + \vec{F}_t(f_c(t)+v,t)
-% 
-%     Gt_x(:,ii) = surf_Ft_fun_x(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii))+...
-%       d_fc_fm(ii)*surf_Ff_fun_x(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-% 
-%     Gt_y(:,ii) = surf_Ft_fun_y(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii))+...
-%         d_fc_fm(ii)*surf_Ff_fun_y(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-%     % Gt_z(:,ii) = surf_Ft_fun_z(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii))+...
-%     %     d_fc_fm(ii)*surf_Ff_fun_y(linspace(-BW_fm(ii)/2,BW_fm(ii)/2,N_f)+fc_fm(ii),t(ii));
-% 
-% end
+%Const Fast-Time Vel
+G_x = k_const*freq_fm_mesh.*(ones(N_f,1)*(RGrad_x + 2*Bi_Range.*RRGrad_x/c_sol));
+G_y = k_const*freq_fm_mesh.*(ones(N_f,1)*(RGrad_y + 2*Bi_Range.*RRGrad_y/c_sol));
+G_z = zeros(N_f,N_t);
 
 
-%Partial derivative w.r.t slow-time t
-% Ft_x = k_const*freq.'*RRGrad_fun_x(t); 
-% Ft_y = k_const*freq.'*RRGrad_fun_y(t); 
-% Ft_z = k_const*freq.'*RRGrad_fun_z(t); 
+%Move-stop-Move
+% Ft_x = k_const*freq_mesh.*(ones(N_f,1)*RRGrad_x);
+% Ft_y = k_const*freq_mesh.*(ones(N_f,1)*RRGrad_y);
 % Ft_z = zeros(N_f,N_t);
 
-Ft_x = k_const*freq_mesh.*(ones(N_f,1)*RRGrad_x);
-Ft_y = k_const*freq_mesh.*(ones(N_f,1)*RRGrad_y);
+%Const Fast-Time Vel
+Ft_x = k_const*freq_mesh.*(ones(N_f,1)*(RRGrad_x + (2/c_sol)*(Bi_RRange.*RRGrad_x + Bi_Range.*RRRGrad_x)));
+Ft_y = k_const*freq_mesh.*(ones(N_f,1)*(RRGrad_y + (2/c_sol)*(Bi_RRange.*RRGrad_y + Bi_Range.*RRRGrad_y)));
 Ft_z = zeros(N_f,N_t);
 
 NFt_x = Ft_x./sqrt(Ft_x.^2+Ft_y.^2);
@@ -817,14 +864,17 @@ NFt_y = Ft_y./sqrt(Ft_x.^2+Ft_y.^2);
 NFt_z = zeros(N_f,N_t);
 
 
-% Ft_x = surf_Ft_fun_x(freq,t);
-% Ft_y = surf_Ft_fun_y(freq,t);
-% Ft_z = surf_Ft_fun_z(freq,t);
+%Move-stop-Move
+% Gt_x = k_const*( ones(N_f,1)*(d_fc_fm.*RGrad_x) + freq_fm_mesh.*(ones(N_f,1)*RRGrad_x));
+% Gt_y = k_const*( ones(N_f,1)*(d_fc_fm.*RGrad_y) + freq_fm_mesh.*(ones(N_f,1)*RRGrad_y));
+% Gt_z = zeros(N_f,N_t);
 
 
-%%%%
-Gt_x = k_const*( ones(N_f,1)*(d_fc_fm.*RGrad_x) + freq_fm_mesh.*(ones(N_f,1)*RRGrad_x));
-Gt_y = k_const*( ones(N_f,1)*(d_fc_fm.*RGrad_y) + freq_fm_mesh.*(ones(N_f,1)*RRGrad_y));
+%Const Fast-Time Vel
+Gt_x = k_const*dt_freq_fm_mesh.*(ones(N_f,1)*(RGrad_x + 2*Bi_Range.*RRGrad_x/c_sol)) +...
+k_const*freq_fm_mesh.*(ones(N_f,1)*(RRGrad_x + 2*Bi_RRange.*RRGrad_x/c_sol + 2*Bi_Range.*RRRGrad_x/c_sol));
+Gt_y = k_const*dt_freq_fm_mesh.*(ones(N_f,1)*(RGrad_y + 2*Bi_Range.*RRGrad_y/c_sol)) +...
+k_const*freq_fm_mesh.*(ones(N_f,1)*(RRGrad_y + 2*Bi_RRange.*RRGrad_y/c_sol + 2*Bi_Range.*RRRGrad_y/c_sol));
 Gt_z = zeros(N_f,N_t);
 
 NGt_x = Gt_x./sqrt(Gt_x.^2+Gt_y.^2);
@@ -832,26 +882,30 @@ NGt_y = Gt_y./sqrt(Gt_x.^2+Gt_y.^2);
 NGt_z = zeros(N_f,N_t);
 
 %Partial derivative w.r.t freq f
-% Ff_x = k_const*ones(size(freq)).'*RGrad_fun_x(t); 
-% Ff_y = k_const*ones(size(freq)).'*RGrad_fun_y(t); 
-% Ff_z = k_const*ones(size(freq)).'*RGrad_fun_z(t); 
-% Ff_z = zeros(N_f,N_t); 
 
-Ff_x = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_x);
-Ff_y = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_y);
+%Move-stop-Move
+% Ff_x = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_x);
+% Ff_y = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_y);
+% Ff_z = zeros(N_f,N_t);
+
+Ff_x = k_const*ones(N_f,1)*(RGrad_x + 2*Bi_Range.*RRGrad_x/c_sol);
+Ff_y = k_const*ones(N_f,1)*(RGrad_y + 2*Bi_Range.*RRGrad_y/c_sol);
 Ff_z = zeros(N_f,N_t);
+
 
 NFf_x = Ff_x./sqrt(Ff_x.^2+Ff_y.^2);
 NFf_y = Ff_y./sqrt(Ff_x.^2+Ff_y.^2);
 NFf_z = zeros(N_f,N_t);
 
-% Ff_x = surf_Ff_fun_x(freq,t);
-% Ff_y = surf_Ff_fun_y(freq,t);
-% Ff_z = surf_Ff_fun_z(freq,t);
 
-%%%%
-Gf_x = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_x);
-Gf_y = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_y);
+%Move-stop-Move
+% Gf_x = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_x);
+% Gf_y = k_const*ones(N_f,N_t).*(ones(N_f,1)*RGrad_y);
+% Gf_z = zeros(N_f,N_t);
+
+%Const Fast-Time Vel
+Gf_x = k_const*ones(N_f,1)*(RGrad_x + 2*Bi_Range.*RRGrad_x/c_sol);
+Gf_y = k_const*ones(N_f,1)*(RGrad_y + 2*Bi_Range.*RRGrad_y/c_sol);
 Gf_z = zeros(N_f,N_t);
 
 NGf_x = Gf_x./sqrt(Gf_x.^2+Gf_y.^2);
@@ -871,8 +925,6 @@ Gt_cross_Gf_y = Gt_z.*Gf_x - Gt_x.*Gf_z;
 Ft_cross_Ff_z = Ft_x.*Ff_y - Ft_y.*Ff_x;
 Gt_cross_Gf_z = Gt_x.*Gf_y - Gt_y.*Gf_x;
 
- 
-
 weight_F = 1./abs(Ft_cross_Ff_z);
 weight_F = weight_F/sum(weight_F(:));
 
@@ -888,14 +940,22 @@ weight_uniform = weight_uniform/sum(weight_uniform(:));
 %Slowtime parameterized center frequency K-space path along passband
 %surface( when projected to the ground plane).
 % \vec{alpha}(t)
-alpha_k_pos_fun = @(tau) k_const*fc*[RGrad_fun_x(tau);RGrad_fun_y(tau);zeros(size(tau))];
-bravo_k_pos_fun = @(tau) k_const*fc_fm_fun(tau).*[RGrad_fun_x(tau);RGrad_fun_y(tau);zeros(size(tau))];
+% alpha_k_pos_fun = @(tau) k_const*fc*[RGrad_fun_x(tau);RGrad_fun_y(tau);zeros(size(tau))];
+% bravo_k_pos_fun = @(tau) k_const*fc_fm_fun(tau).*[RGrad_fun_x(tau);RGrad_fun_y(tau);zeros(size(tau))];
+
+alpha_k_pos_fun = @(tau) k_const*fc*Mod_vec_fun(tau);
+bravo_k_pos_fun = @(tau) k_const*fc_fm_fun(tau).*[Mod_vec_fun_x(tau);Mod_vec_fun_y(tau);zeros(size(tau))];
 
 
 %time derivative % \vec{\dot{alpha}}(t) = \frac{d}{dt} \vec{\alpha}(t)
-dot_alpha_k_pos_fun = @(tau) k_const*fc*[RRGrad_fun_x(tau);RRGrad_fun_y(tau);zeros(size(tau))];
-dot_bravo_k_pos_fun = @(tau) k_const*d_fc_fm_fun(tau).*[RGrad_fun_x(tau);RGrad_fun_y(tau);zeros(size(tau))] + ...
-    fc_fm_fun(tau).*[RRGrad_fun_x(tau);RRGrad_fun_y(tau);zeros(size(tau))];
+% dot_alpha_k_pos_fun = @(tau) k_const*fc*[RRGrad_fun_x(tau);RRGrad_fun_y(tau);zeros(size(tau))];
+% dot_bravo_k_pos_fun = @(tau) k_const*d_fc_fm_fun(tau).*[RGrad_fun_x(tau);RGrad_fun_y(tau);zeros(size(tau))] + ...
+%     fc_fm_fun(tau).*[RRGrad_fun_x(tau);RRGrad_fun_y(tau);zeros(size(tau))];
+
+dot_alpha_k_pos_fun = @(tau) k_const*fc*d_Mod_vec_fun(tau);
+dot_bravo_k_pos_fun = @(tau) k_const*d_fc_fm_fun(tau).*Mod_vec_fun(tau) + ...
+    fc_fm_fun(tau).*d_Mod_vec_fun(tau);
+
 
 %speed along path % |\vec{\dot{alpha}}(t)| 
 dot_alpha_k_pos_mag_fun = @(tau) sqrt(dot(dot_alpha_k_pos_fun(tau),dot_alpha_k_pos_fun(tau),1 ));
@@ -1103,6 +1163,14 @@ Pos_RX_gpu_x = gpuArray(POS_RX(1,:));
 Pos_RX_gpu_y = gpuArray(POS_RX(2,:));
 Pos_RX_gpu_z = gpuArray(POS_RX(3,:));
 
+Vel_TX_gpu_x = gpuArray(Vel_TX(1,:));
+Vel_TX_gpu_y = gpuArray(Vel_TX(2,:));
+Vel_TX_gpu_z = gpuArray(Vel_TX(3,:));
+
+Vel_RX_gpu_x = gpuArray(Vel_RX(1,:));
+Vel_RX_gpu_y = gpuArray(Vel_RX(2,:));
+Vel_RX_gpu_z = gpuArray(Vel_RX(3,:));
+
 fc_gpu = gpuArray(fc*ones(1,N_t));
 BW_gpu = gpuArray(BW*ones(1,N_t));
 
@@ -1115,6 +1183,8 @@ w2d_gpu = gpuArray(weight_uniform);
     x_psf_gpu,y_psf_gpu,z_psf_gpu,...
     Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
     Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+    Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+    Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...    
     0,0,0,...
     fc_gpu,BW_gpu,w2d_gpu,...
     int32(N_t),int32(N_f),int32(N_psf*N_psf));
@@ -1126,7 +1196,7 @@ psf = zeros(N_psf,N_psf);
 psf(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-psf = psf./max(abs(psf(:)));
+% psf = psf./max(abs(psf(:)));
 
 %%%%%%%%
 w2d_gpu = gpuArray(weight_F);
@@ -1135,6 +1205,8 @@ w2d_gpu = gpuArray(weight_F);
     x_psf_gpu,y_psf_gpu,z_psf_gpu,...
     Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
     Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+    Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+    Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...    
     0,0,0,...
     fc_gpu,BW_gpu,w2d_gpu,...
     int32(N_t),int32(N_f),int32(N_psf*N_psf));
@@ -1146,7 +1218,7 @@ psf_am = zeros(N_psf,N_psf);
 psf_am(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-psf_am = psf_am./max(abs(psf_am(:)));
+% psf_am = psf_am./max(abs(psf_am(:)));
 
 
 %taylor window version
@@ -1157,6 +1229,8 @@ w2d_gpu = gpuArray(taylorwin_2D_F);
     x_psf_gpu,y_psf_gpu,z_psf_gpu,...
     Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
     Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+    Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+    Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...    
     0,0,0,...
     fc_gpu,BW_gpu,w2d_gpu,...
     int32(N_t),int32(N_f),int32(N_psf*N_psf));
@@ -1168,7 +1242,7 @@ psf_taylor = zeros(N_psf,N_psf);
 psf_taylor(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-psf_taylor = psf_taylor./max(abs(psf_taylor(:)));
+% psf_taylor = psf_taylor./max(abs(psf_taylor(:)));
 
 %%%%%%
 %Use the frequency agile parameters
@@ -1181,6 +1255,8 @@ BW_fm_gpu = gpuArray(BW_fm);
     x_psf_gpu,y_psf_gpu,z_psf_gpu,...
     Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
     Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+    Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+    Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...    
     0,0,0,...
     fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
     int32(N_t),int32(N_f),int32(N_psf*N_psf));
@@ -1192,7 +1268,7 @@ psf_fm = zeros(N_psf,N_psf);
 psf_fm(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-psf_fm = psf_fm./max(abs(psf_fm(:)));
+% psf_fm = psf_fm./max(abs(psf_fm(:)));
 
 
 w2d_gpu = gpuArray(weight_G);
@@ -1201,6 +1277,8 @@ w2d_gpu = gpuArray(weight_G);
     x_psf_gpu,y_psf_gpu,z_psf_gpu,...
     Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
     Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+    Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+    Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...    
     0,0,0,...
     fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
     int32(N_t),int32(N_f),int32(N_psf*N_psf));
@@ -1212,7 +1290,7 @@ psf_amfm = zeros(N_psf,N_psf);
 psf_amfm(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-psf_amfm = psf_amfm./max(abs(psf_amfm(:)));
+% psf_amfm = psf_amfm./max(abs(psf_amfm(:)));
 
 
 %taylor window with agile frequency version
@@ -1223,6 +1301,8 @@ w2d_gpu = gpuArray(taylorwin_2D_G);
     x_psf_gpu,y_psf_gpu,z_psf_gpu,...
     Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
     Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+    Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+    Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...    
     0,0,0,...
     fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
     int32(N_t),int32(N_f),int32(N_psf*N_psf));
@@ -1234,7 +1314,7 @@ psf_fm_taylor = zeros(N_psf,N_psf);
 psf_fm_taylor(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-psf_fm_taylor = psf_fm_taylor./max(abs(psf_fm_taylor(:)));
+% psf_fm_taylor = psf_fm_taylor./max(abs(psf_fm_taylor(:)));
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 display('IPR CUDA');
@@ -1265,6 +1345,12 @@ RGrad_gpu_x = gpuArray(RGrad(1,:));
 RGrad_gpu_y = gpuArray(RGrad(2,:));
 RGrad_gpu_z = gpuArray(RGrad(3,:));
 
+RRGrad_gpu_x = gpuArray(RRGrad(1,:));
+RRGrad_gpu_y = gpuArray(RRGrad(2,:));
+RRGrad_gpu_z = gpuArray(RRGrad(3,:));
+
+RO_gpu = gpuArray( sqrt(dot(POS_TX,POS_TX,1)) + sqrt(dot(POS_RX,POS_RX,1)));
+
 fc_gpu = gpuArray(fc*ones(1,N_t));
 BW_gpu = gpuArray(BW*ones(1,N_t));
 % wt_gpu = gpuArray(ones(1,N_t)/N_t);
@@ -1277,7 +1363,8 @@ w2d_gpu = gpuArray(weight_uniform);
 [y1 y2] = feval(k,IPR_real,IPR_imag,...
 x_psf_gpu,y_psf_gpu,z_psf_gpu,...
 RGrad_gpu_x,RGrad_gpu_y,RGrad_gpu_z,...
-fc_gpu,BW_gpu,w2d_gpu,...
+RRGrad_gpu_x,RRGrad_gpu_y,RRGrad_gpu_z,...
+RO_gpu,fc_gpu,BW_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_psf*N_psf));
 
 %allocate system memory for output 
@@ -1287,7 +1374,7 @@ ipr = zeros(N_psf,N_psf);
 ipr(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-ipr = ipr./max(abs(ipr(:)));
+% ipr = ipr./max(abs(ipr(:)));
 
 %AM IPR
 w2d_gpu = gpuArray(weight_F);
@@ -1295,7 +1382,8 @@ w2d_gpu = gpuArray(weight_F);
 [y1 y2] = feval(k,IPR_real,IPR_imag,...
 x_psf_gpu,y_psf_gpu,z_psf_gpu,...
 RGrad_gpu_x,RGrad_gpu_y,RGrad_gpu_z,...
-fc_gpu,BW_gpu,w2d_gpu,...
+RRGrad_gpu_x,RRGrad_gpu_y,RRGrad_gpu_z,...
+RO_gpu,fc_gpu,BW_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_psf*N_psf));
 
 %allocate system memory for output 
@@ -1305,7 +1393,7 @@ ipr_am = zeros(N_psf,N_psf);
 ipr_am(:) = gather(y1)+j*gather(y2);
 
 %Normalize the IPR
-ipr_am = ipr_am./max(abs(ipr_am(:)));
+% ipr_am = ipr_am./max(abs(ipr_am(:)));
 
 %taylor window version
 w2d_gpu = gpuArray(taylorwin_2D_F);
@@ -1314,7 +1402,8 @@ w2d_gpu = gpuArray(taylorwin_2D_F);
 [y1 y2] = feval(k,IPR_real,IPR_imag,...
 x_psf_gpu,y_psf_gpu,z_psf_gpu,...
 RGrad_gpu_x,RGrad_gpu_y,RGrad_gpu_z,...
-fc_gpu,BW_gpu,w2d_gpu,...
+RRGrad_gpu_x,RRGrad_gpu_y,RRGrad_gpu_z,...
+RO_gpu,fc_gpu,BW_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_psf*N_psf));
 
 %allocate system memory for output 
@@ -1324,7 +1413,7 @@ ipr_taylor = zeros(N_psf,N_psf);
 ipr_taylor(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-ipr_taylor = ipr_taylor./max(abs(ipr_taylor(:)));
+% ipr_taylor = ipr_taylor./max(abs(ipr_taylor(:)));
 
 
 %%%%%%
@@ -1337,7 +1426,8 @@ BW_fm_gpu = gpuArray(BW_fm);
 [y1 y2] = feval(k,IPR_real,IPR_imag,...
 x_psf_gpu,y_psf_gpu,z_psf_gpu,...
 RGrad_gpu_x,RGrad_gpu_y,RGrad_gpu_z,...
-fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
+RRGrad_gpu_x,RRGrad_gpu_y,RRGrad_gpu_z,...
+RO_gpu,fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_psf*N_psf));
 
 %allocate system memory for output 
@@ -1347,7 +1437,7 @@ ipr_fm = zeros(N_psf,N_psf);
 ipr_fm(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-ipr_fm = ipr_fm./max(abs(ipr_fm(:)));
+% ipr_fm = ipr_fm./max(abs(ipr_fm(:)));
 
 %AMFM IPR
 w2d_gpu = gpuArray(weight_G);
@@ -1356,7 +1446,8 @@ w2d_gpu = gpuArray(weight_G);
 [y1 y2] = feval(k,IPR_real,IPR_imag,...
 x_psf_gpu,y_psf_gpu,z_psf_gpu,...
 RGrad_gpu_x,RGrad_gpu_y,RGrad_gpu_z,...
-fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
+RRGrad_gpu_x,RRGrad_gpu_y,RRGrad_gpu_z,...
+RO_gpu,fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_psf*N_psf));
 
 %allocate system memory for output 
@@ -1366,7 +1457,7 @@ ipr_amfm = zeros(N_psf,N_psf);
 ipr_amfm(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-ipr_amfm = ipr_amfm./max(abs(ipr_amfm(:)));
+% ipr_amfm = ipr_amfm./max(abs(ipr_amfm(:)));
 
 %taylor window with agile frequency version
 w2d_gpu = gpuArray(taylorwin_2D_G);
@@ -1375,7 +1466,8 @@ w2d_gpu = gpuArray(taylorwin_2D_G);
 [y1 y2] = feval(k,IPR_real,IPR_imag,...
 x_psf_gpu,y_psf_gpu,z_psf_gpu,...
 RGrad_gpu_x,RGrad_gpu_y,RGrad_gpu_z,...
-fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
+RRGrad_gpu_x,RRGrad_gpu_y,RRGrad_gpu_z,...
+RO_gpu,fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_psf*N_psf));
 
 %allocate system memory for output 
@@ -1385,7 +1477,7 @@ ipr_fm_taylor = zeros(N_psf,N_psf);
 ipr_fm_taylor(:) = gather(y1)+j*gather(y2);
 
 %Normalize the PSF
-ipr_fm_taylor = ipr_fm_taylor./max(abs(ipr_fm_taylor(:)));
+% ipr_fm_taylor = ipr_fm_taylor./max(abs(ipr_fm_taylor(:)));
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -1394,14 +1486,24 @@ display('CUDA Phase History');
 %Clear the GPU
 reset(device);
 
+% Problem size
+Ntot = N_f * N_t;
+
 %prep the kernel
 k = parallel.gpu.CUDAKernel('PhaseHist_Kernel.ptx','PhaseHist_Kernel.cu');
+cap = min(device.MaxThreadsPerBlock, k.MaxThreadsPerBlock);  % cap = 896 here
+warp = 32;
 
-N1=1024;
-N2=2^ceil(log( N_f*N_t/N1)/log(2));
-N2=max([N2 1]);
-k.ThreadBlockSize = [N1,1,1];
-k.GridSize=[N2,1,1];
+% Choose a good block size (portable, efficient)
+N1 = min(256, cap);                     % 256 is a safe default
+N1 = warp * floor(N1/warp);             % enforce multiple of 32
+if N1 == 0, N1 = warp; end
+
+% Grid size to cover everything; kernel already strides by blockDim*gridDim
+N2 = ceil(Ntot / N1);
+
+k.ThreadBlockSize = [N1, 1, 1];
+k.GridSize        = [N2, 1, 1];
 
 %allocate Memory for output
 PH_real = gpuArray(zeros(N_f*N_t,1));
@@ -1421,6 +1523,14 @@ Pos_RX_gpu_x = gpuArray(POS_RX(1,:));
 Pos_RX_gpu_y = gpuArray(POS_RX(2,:));
 Pos_RX_gpu_z = gpuArray(POS_RX(3,:));
 
+Vel_TX_gpu_x = gpuArray(Vel_TX(1,:));
+Vel_TX_gpu_y = gpuArray(Vel_TX(2,:));
+Vel_TX_gpu_z = gpuArray(Vel_TX(3,:));
+
+Vel_RX_gpu_x = gpuArray(Vel_RX(1,:));
+Vel_RX_gpu_y = gpuArray(Vel_RX(2,:));
+Vel_RX_gpu_z = gpuArray(Vel_RX(3,:));
+
 fc_gpu = gpuArray(fc*ones(1,N_t));
 BW_gpu = gpuArray(BW*ones(1,N_t));
 
@@ -1434,6 +1544,8 @@ w2d_gpu = gpuArray(ones(N_f,N_t));
 tgt_gpu_x,tgt_gpu_y,tgt_gpu_z,tgt_gpu_rho,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_gpu,BW_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(length(tgt_x)));
 
@@ -1449,6 +1561,8 @@ BW_fm_gpu = gpuArray(BW_fm);
 tgt_gpu_x,tgt_gpu_y,tgt_gpu_z,tgt_gpu_rho,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(length(tgt_x)));
 
@@ -1490,6 +1604,15 @@ Pos_RX_gpu_x = gpuArray(POS_RX(1,:));
 Pos_RX_gpu_y = gpuArray(POS_RX(2,:));
 Pos_RX_gpu_z = gpuArray(POS_RX(3,:));
 
+Vel_TX_gpu_x = gpuArray(Vel_TX(1,:));
+Vel_TX_gpu_y = gpuArray(Vel_TX(2,:));
+Vel_TX_gpu_z = gpuArray(Vel_TX(3,:));
+
+Vel_RX_gpu_x = gpuArray(Vel_RX(1,:));
+Vel_RX_gpu_y = gpuArray(Vel_RX(2,:));
+Vel_RX_gpu_z = gpuArray(Vel_RX(3,:));
+
+
 fc_gpu = gpuArray(fc*ones(1,N_t));
 BW_gpu = gpuArray(BW*ones(1,N_t));
 
@@ -1504,12 +1627,14 @@ w2d_gpu = gpuArray(weight_uniform);
 x_gpu,y_gpu,z_gpu,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_gpu,BW_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_x*N_x));
 
 sar = zeros(N_x,N_x);
 sar(:) = gather(y1)+j*gather(y2);
-sar = sar/max(abs(sar(:)));
+% sar = sar/max(abs(sar(:)));
 
 %AM SAR
 w2d_gpu = gpuArray(weight_F);
@@ -1519,12 +1644,14 @@ w2d_gpu = gpuArray(weight_F);
 x_gpu,y_gpu,z_gpu,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_gpu,BW_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_x*N_x));
 
 sar_am = zeros(N_x,N_x);
 sar_am(:) = gather(y1)+j*gather(y2);
-sar_am = sar_am/max(abs(sar_am(:)));
+% sar_am = sar_am/max(abs(sar_am(:)));
 
 %%%%%%%
 w2d_gpu = gpuArray(taylorwin_2D_F);
@@ -1534,12 +1661,14 @@ w2d_gpu = gpuArray(taylorwin_2D_F);
 x_gpu,y_gpu,z_gpu,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_gpu,BW_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_x*N_x));
 
 sar_taylor = zeros(N_x,N_x);
 sar_taylor(:) = gather(y1)+j*gather(y2);
-sar_taylor = sar_taylor/max(abs(sar_taylor(:)));
+% sar_taylor = sar_taylor/max(abs(sar_taylor(:)));
 
 %Update phase history and frequencies
 PH_real = gpuArray(real(Phase_hist_fm(:)));
@@ -1554,12 +1683,14 @@ w2d_gpu = gpuArray(weight_uniform);
 x_gpu,y_gpu,z_gpu,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_x*N_x));
 
 sar_fm = zeros(N_x,N_x);
 sar_fm = gather(y1)+j*gather(y2);
-sar_fm = sar_fm/max(abs(sar_fm(:)));
+% sar_fm = sar_fm/max(abs(sar_fm(:)));
 
 %AMFM SAR image
 w2d_gpu = gpuArray(weight_G);
@@ -1568,12 +1699,14 @@ w2d_gpu = gpuArray(weight_G);
 x_gpu,y_gpu,z_gpu,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_x*N_x));
 
 sar_amfm = zeros(N_x,N_x);
 sar_amfm = gather(y1)+j*gather(y2);
-sar_amfm = sar_amfm/max(abs(sar_amfm(:)));
+% sar_amfm = sar_amfm/max(abs(sar_amfm(:)));
 
 
 %%%%%%%%%
@@ -1584,97 +1717,99 @@ w2d_gpu = gpuArray(taylorwin_2D_G);
 x_gpu,y_gpu,z_gpu,...
 Pos_TX_gpu_x,Pos_TX_gpu_y,Pos_TX_gpu_z,...
 Pos_RX_gpu_x,Pos_RX_gpu_y,Pos_RX_gpu_z,...
+Vel_TX_gpu_x,Vel_TX_gpu_y,Vel_TX_gpu_z,...
+Vel_RX_gpu_x,Vel_RX_gpu_y,Vel_RX_gpu_z,...
 fc_fm_gpu,BW_fm_gpu,w2d_gpu,...
 int32(N_t),int32(N_f),int32(N_x*N_x));
 
 sar_fm_taylor = zeros(N_x,N_x);
 sar_fm_taylor = gather(y1)+j*gather(y2);
-sar_fm_taylor = sar_fm_taylor/max(abs(sar_fm_taylor(:)));
+% sar_fm_taylor = sar_fm_taylor/max(abs(sar_fm_taylor(:)));
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % 1D metrics
 display('Image IPR metrics')
 %Resolution
-meas_res_XR = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XR_vec,d)),0,1.75*res_XR);
-meas_res_XR_am = fminbnd(@(d) abs(IPR_1d(weight_F,RGrad,freq_mesh,XR_vec,d)),0,1.75*res_XR);
-meas_res_XR_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XR_vec,d)),0,2*res_XR);
-meas_res_XD = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XD_vec,d)),0,1.75*res_XD);
-meas_res_XD_am = fminbnd(@(d) abs(IPR_1d(weight_F,RGrad,freq_mesh,XD_vec,d)),0,1.75*res_XD);
-meas_res_XD_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XD_vec,d)),0,2*res_XD);
+meas_res_XR = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)),0,1.75*res_XR);
+meas_res_XR_am = fminbnd(@(d) abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)),0,1.75*res_XR);
+meas_res_XR_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)),0,2*res_XR);
+meas_res_XD = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)),0,1.75*res_XD);
+meas_res_XD_am = fminbnd(@(d) abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)),0,1.75*res_XD);
+meas_res_XD_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)),0,2*res_XD);
 
-meas_res_XR_fm = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XR_fm_vec,d)),0,1.75*res_XR);
-meas_res_XR_amfm = fminbnd(@(d) abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XR_fm_vec,d)),0,1.75*res_XR);
-meas_res_XR_fm_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XR_fm_vec,d)),0,2*res_XR);
-meas_res_XD_fm = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XD_fm_vec,d)),0,1.75*res_XD);
-meas_res_XD_amfm = fminbnd(@(d) abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XD_fm_vec,d)),0,1.75*res_XD);
-meas_res_XD_fm_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XD_fm_vec,d)),0,2*res_XD);
+meas_res_XR_fm = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)),0,1.75*res_XR);
+meas_res_XR_amfm = fminbnd(@(d) abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)),0,1.75*res_XR);
+meas_res_XR_fm_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)),0,2*res_XR);
+meas_res_XD_fm = fminbnd(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)),0,1.75*res_XD);
+meas_res_XD_amfm = fminbnd(@(d) abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)),0,1.75*res_XD);
+meas_res_XD_fm_taylor = fminbnd(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)),0,2*res_XD);
 
 
 %Peak to Sidelobe ratio (PSLR)
-[SL_XR_loc,PSLR_XR]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XR_vec,d)),meas_res_XR,2*meas_res_XR);
-[SL_XR_loc_am,PSLR_XR_am]           = fminbnd(@(d) 1./abs(IPR_1d(weight_F,RGrad,freq_mesh,XR_vec,d)),meas_res_XR_am,2*meas_res_XR_am);
-[SL_XR_loc_taylor,PSLR_XR_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XR_vec,d)),meas_res_XR_taylor,2*meas_res_XR_taylor);
-[SL_XD_loc,PSLR_XD]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XD_vec,d)),meas_res_XD,2*meas_res_XD);
-[SL_XD_loc_am,PSLR_XD_am]           = fminbnd(@(d) 1./abs(IPR_1d(weight_F,RGrad,freq_mesh,XD_vec,d)),meas_res_XD_am,2*meas_res_XD_am);
-[SL_XD_loc_taylor,PSLR_XD_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XD_vec,d)),meas_res_XD_taylor,2*meas_res_XD_taylor);
+[SL_XR_loc,PSLR_XR]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)),meas_res_XR,2*meas_res_XR);
+[SL_XR_loc_am,PSLR_XR_am]           = fminbnd(@(d) 1./abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)),meas_res_XR_am,2*meas_res_XR_am);
+[SL_XR_loc_taylor,PSLR_XR_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)),meas_res_XR_taylor,2*meas_res_XR_taylor);
+[SL_XD_loc,PSLR_XD]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)),meas_res_XD,2*meas_res_XD);
+[SL_XD_loc_am,PSLR_XD_am]           = fminbnd(@(d) 1./abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)),meas_res_XD_am,2*meas_res_XD_am);
+[SL_XD_loc_taylor,PSLR_XD_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)),meas_res_XD_taylor,2*meas_res_XD_taylor);
 
-[SL_XR_loc_fm,PSLR_XR_fm]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XR_fm_vec,d)),meas_res_XR_fm,2*meas_res_XR_fm);
-[SL_XR_loc_amfm,PSLR_XR_amfm]             = fminbnd(@(d) 1./abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XR_fm_vec,d)),meas_res_XR_amfm,2*meas_res_XR_amfm);
-[SL_XR_loc_fm_taylor,PSLR_XR_fm_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XR_fm_vec,d)),meas_res_XR_fm_taylor,2*meas_res_XR_fm_taylor);
-[SL_XD_loc_fm,PSLR_XD_fm]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XD_fm_vec,d)),meas_res_XD_fm,2*meas_res_XD_fm);
-[SL_XD_loc_amfm,PSLR_XD_amfm]             = fminbnd(@(d) 1./abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XD_fm_vec,d)),meas_res_XD_amfm,2*meas_res_XD_amfm);
-[SL_XD_loc_fm_taylor,PSLR_XD_fm_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XD_fm_vec,d)),meas_res_XD_fm_taylor,2*meas_res_XD_fm_taylor);
+[SL_XR_loc_fm,PSLR_XR_fm]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)),meas_res_XR_fm,2*meas_res_XR_fm);
+[SL_XR_loc_amfm,PSLR_XR_amfm]             = fminbnd(@(d) 1./abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)),meas_res_XR_amfm,2*meas_res_XR_amfm);
+[SL_XR_loc_fm_taylor,PSLR_XR_fm_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)),meas_res_XR_fm_taylor,2*meas_res_XR_fm_taylor);
+[SL_XD_loc_fm,PSLR_XD_fm]                 = fminbnd(@(d) 1./abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)),meas_res_XD_fm,2*meas_res_XD_fm);
+[SL_XD_loc_amfm,PSLR_XD_amfm]             = fminbnd(@(d) 1./abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)),meas_res_XD_amfm,2*meas_res_XD_amfm);
+[SL_XD_loc_fm_taylor,PSLR_XD_fm_taylor]   = fminbnd(@(d) 1./abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)),meas_res_XD_fm_taylor,2*meas_res_XD_fm_taylor);
 
 %integrated sidelobe ratio (ISLR)
-SL_int_XR = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XR_vec,d)).^2,meas_res_XR,10*meas_res_XR);
-ML_int_XR = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XR_vec,d)).^2,0,meas_res_XR);
+SL_int_XR = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)).^2,meas_res_XR,10*meas_res_XR);
+ML_int_XR = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)).^2,0,meas_res_XR);
 ISLR_XR_dB = 10*log10(SL_int_XR/ML_int_XR);
 
-SL_int_XR_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,freq_mesh,XR_vec,d)).^2,meas_res_XR_am,10*meas_res_XR_am);
-ML_int_XR_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,freq_mesh,XR_vec,d)).^2,0,meas_res_XR_am);
+SL_int_XR_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)).^2,meas_res_XR_am,10*meas_res_XR_am);
+ML_int_XR_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)).^2,0,meas_res_XR_am);
 ISLR_XR_am_dB = 10*log10(SL_int_XR_am/ML_int_XR_am);
 
 
-SL_int_XR_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XR_vec,d)).^2,meas_res_XR_taylor,10*meas_res_XR_taylor);
-ML_int_XR_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XR_vec,d)).^2,0,meas_res_XR_taylor);
+SL_int_XR_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)).^2,meas_res_XR_taylor,10*meas_res_XR_taylor);
+ML_int_XR_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d)).^2,0,meas_res_XR_taylor);
 ISLR_XR_taylor_dB = 10*log10(SL_int_XR_taylor/ML_int_XR_taylor);
 
-SL_int_XD = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XD_vec,d)).^2,meas_res_XD,10*meas_res_XD);
-ML_int_XD = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_mesh,XD_vec,d)).^2,0,meas_res_XD);
+SL_int_XD = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)).^2,meas_res_XD,10*meas_res_XD);
+ML_int_XD = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)).^2,0,meas_res_XD);
 ISLR_XD_dB = 10*log10(SL_int_XD/ML_int_XD);
 
-SL_int_XD_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,freq_mesh,XD_vec,d)).^2,meas_res_XD_am,10*meas_res_XD_am);
-ML_int_XD_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,freq_mesh,XD_vec,d)).^2,0,meas_res_XD_am);
+SL_int_XD_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)).^2,meas_res_XD_am,10*meas_res_XD_am);
+ML_int_XD_am = integral(@(d) abs(IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)).^2,0,meas_res_XD_am);
 ISLR_XD_am_dB = 10*log10(SL_int_XD_am/ML_int_XD_am);
 
-SL_int_XD_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XD_vec,d)).^2,meas_res_XD_taylor,10*meas_res_XD_taylor);
-ML_int_XD_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XD_vec,d)).^2,0,meas_res_XD_taylor);
+SL_int_XD_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)).^2,meas_res_XD_taylor,10*meas_res_XD_taylor);
+ML_int_XD_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d)).^2,0,meas_res_XD_taylor);
 ISLR_XD_taylor_dB = 10*log10(SL_int_XD_taylor/ML_int_XD_taylor);
 
-SL_int_XR_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XR_fm_vec,d)).^2,meas_res_XR_fm,10*meas_res_XR_fm);
-ML_int_XR_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XR_fm_vec,d)).^2,0,meas_res_XR_fm);
+SL_int_XR_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)).^2,meas_res_XR_fm,10*meas_res_XR_fm);
+ML_int_XR_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)).^2,0,meas_res_XR_fm);
 ISLR_XR_fm_dB = 10*log10(SL_int_XR_fm/ML_int_XR_fm);
 
-SL_int_XR_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XR_fm_vec,d)).^2,meas_res_XR_amfm,10*meas_res_XR_amfm);
-ML_int_XR_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XR_fm_vec,d)).^2,0,meas_res_XR_amfm);
+SL_int_XR_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)).^2,meas_res_XR_amfm,10*meas_res_XR_amfm);
+ML_int_XR_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)).^2,0,meas_res_XR_amfm);
 ISLR_XR_amfm_dB = 10*log10(SL_int_XR_amfm/ML_int_XR_amfm);
 
-SL_int_XR_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XR_fm_vec,d)).^2,meas_res_XR_fm_taylor,10*meas_res_XR_fm_taylor);
-ML_int_XR_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XR_fm_vec,d)).^2,0,meas_res_XR_fm_taylor);
+SL_int_XR_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)).^2,meas_res_XR_fm_taylor,10*meas_res_XR_fm_taylor);
+ML_int_XR_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d)).^2,0,meas_res_XR_fm_taylor);
 ISLR_XR_fm_taylor_dB = 10*log10(SL_int_XR_fm_taylor/ML_int_XR_fm_taylor);
 
 
-SL_int_XD_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XD_fm_vec,d)).^2,meas_res_XD_fm,10*meas_res_XD_fm);
-ML_int_XD_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XD_fm_vec,d)).^2,0,meas_res_XD_fm);
+SL_int_XD_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)).^2,meas_res_XD_fm,10*meas_res_XD_fm);
+ML_int_XD_fm = integral(@(d) abs(IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)).^2,0,meas_res_XD_fm);
 ISLR_XD_fm_dB = 10*log10(SL_int_XD_fm/ML_int_XD_fm);
 
-SL_int_XD_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XD_fm_vec,d)).^2,meas_res_XD_amfm,10*meas_res_XD_amfm);
-ML_int_XD_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,freq_fm_mesh,XD_fm_vec,d)).^2,0,meas_res_XD_amfm);
+SL_int_XD_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)).^2,meas_res_XD_amfm,10*meas_res_XD_amfm);
+ML_int_XD_amfm = integral(@(d) abs(IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)).^2,0,meas_res_XD_amfm);
 ISLR_XD_amfm_dB = 10*log10(SL_int_XD_amfm/ML_int_XD_amfm);
 
 
-SL_int_XD_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XD_fm_vec,d)).^2,meas_res_XD_fm_taylor,10*meas_res_XD_fm_taylor);
-ML_int_XD_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XD_fm_vec,d)).^2,0,meas_res_XD_fm_taylor);
+SL_int_XD_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)).^2,meas_res_XD_fm_taylor,10*meas_res_XD_fm_taylor);
+ML_int_XD_fm_taylor = integral(@(d) abs(IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d)).^2,0,meas_res_XD_fm_taylor);
 ISLR_XD_fm_taylor_dB = 10*log10(SL_int_XD_fm_taylor/ML_int_XD_fm_taylor);
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -1689,34 +1824,34 @@ max_d = max([meas_res_XR_taylor meas_res_XD_taylor meas_res_XR_fm_taylor meas_re
 d = linspace(0,10*max_d,2^12);
 
 %IPRs
-ipr_XR          = IPR_1d(weight_uniform,RGrad,freq_mesh,XR_vec,d);
-ipr_XR_am       = IPR_1d(weight_F,RGrad,freq_mesh,XR_vec,d);
-ipr_XR_taylor   = IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XR_vec,d);
-ipr_XD          = IPR_1d(weight_uniform,RGrad,freq_mesh,XD_vec,d);
-ipr_XD_am       = IPR_1d(weight_F,RGrad,freq_mesh,XD_vec,d);
-ipr_XD_taylor   = IPR_1d(taylorwin_2D_F,RGrad,freq_mesh,XD_vec,d);
+ipr_XR          = IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d);
+ipr_XR_am       = IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d);
+ipr_XR_taylor   = IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XR_vec,d);
+ipr_XD          = IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d);
+ipr_XD_am       = IPR_1d(weight_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d);
+ipr_XD_taylor   = IPR_1d(taylorwin_2D_F,RGrad,RRGrad,Bi_Range,freq_mesh,XD_vec,d);
 
-ipr_XR_fm          = IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XR_fm_vec,d);
-ipr_XR_amfm        = IPR_1d(weight_G,RGrad,freq_fm_mesh,XR_fm_vec,d);
-ipr_XR_fm_taylor   = IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XR_fm_vec,d);
-ipr_XD_fm          = IPR_1d(weight_uniform,RGrad,freq_fm_mesh,XD_fm_vec,d);
-ipr_XD_amfm        = IPR_1d(weight_G,RGrad,freq_fm_mesh,XD_fm_vec,d);
-ipr_XD_fm_taylor   = IPR_1d(taylorwin_2D_G,RGrad,freq_fm_mesh,XD_fm_vec,d);
+ipr_XR_fm          = IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d);
+ipr_XR_amfm        = IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d);
+ipr_XR_fm_taylor   = IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XR_fm_vec,d);
+ipr_XD_fm          = IPR_1d(weight_uniform,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d);
+ipr_XD_amfm        = IPR_1d(weight_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d);
+ipr_XD_fm_taylor   = IPR_1d(taylorwin_2D_G,RGrad,RRGrad,Bi_Range,freq_fm_mesh,XD_fm_vec,d);
 
 %PSFs
-psf_XR          = PSF_1d(weight_uniform,POS_TX,POS_RX,freq_mesh,XR_vec,[0;0;0],d);
-psf_XR_am       = PSF_1d(weight_F,POS_TX,POS_RX,freq_mesh,XR_vec,[0;0;0],d);
-psf_XR_taylor   = PSF_1d(taylorwin_2D_F,POS_TX,POS_RX,freq_mesh,XR_vec,[0;0;0],d);
-psf_XD          = PSF_1d(weight_uniform,POS_TX,POS_RX,freq_mesh,XD_vec,[0;0;0],d);
-psf_XD_am       = PSF_1d(weight_F,POS_TX,POS_RX,freq_mesh,XD_vec,[0;0;0],d);
-psf_XD_taylor   = PSF_1d(taylorwin_2D_F,POS_TX,POS_RX,freq_mesh,XD_vec,[0;0;0],d);
+psf_XR          = PSF_1d(weight_uniform,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_mesh,XR_vec,[0;0;0],d);
+psf_XR_am       = PSF_1d(weight_F,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_mesh,XR_vec,[0;0;0],d);
+psf_XR_taylor   = PSF_1d(taylorwin_2D_F,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_mesh,XR_vec,[0;0;0],d);
+psf_XD          = PSF_1d(weight_uniform,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_mesh,XD_vec,[0;0;0],d);
+psf_XD_am       = PSF_1d(weight_F,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_mesh,XD_vec,[0;0;0],d);
+psf_XD_taylor   = PSF_1d(taylorwin_2D_F,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_mesh,XD_vec,[0;0;0],d);
 
-psf_XR_fm          = PSF_1d(weight_uniform,POS_TX,POS_RX,freq_fm_mesh,XR_fm_vec,[0;0;0],d);
-psf_XR_amfm        = PSF_1d(weight_G,POS_TX,POS_RX,freq_fm_mesh,XR_fm_vec,[0;0;0],d);
-psf_XR_fm_taylor   = PSF_1d(taylorwin_2D_G,POS_TX,POS_RX,freq_fm_mesh,XR_fm_vec,[0;0;0],d);
-psf_XD_fm          = PSF_1d(weight_uniform,POS_TX,POS_RX,freq_fm_mesh,XD_fm_vec,[0;0;0],d);
-psf_XD_amfm        = PSF_1d(weight_G,POS_TX,POS_RX,freq_fm_mesh,XD_fm_vec,[0;0;0],d);
-psf_XD_fm_taylor   = PSF_1d(taylorwin_2D_G,POS_TX,POS_RX,freq_fm_mesh,XD_fm_vec,[0;0;0],d);
+psf_XR_fm          = PSF_1d(weight_uniform,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_fm_mesh,XR_fm_vec,[0;0;0],d);
+psf_XR_amfm        = PSF_1d(weight_G,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_fm_mesh,XR_fm_vec,[0;0;0],d);
+psf_XR_fm_taylor   = PSF_1d(taylorwin_2D_G,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_fm_mesh,XR_fm_vec,[0;0;0],d);
+psf_XD_fm          = PSF_1d(weight_uniform,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_fm_mesh,XD_fm_vec,[0;0;0],d);
+psf_XD_amfm        = PSF_1d(weight_G,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_fm_mesh,XD_fm_vec,[0;0;0],d);
+psf_XD_fm_taylor   = PSF_1d(taylorwin_2D_G,POS_TX,POS_RX,Vel_TX,Vel_RX,freq_fm_mesh,XD_fm_vec,[0;0;0],d);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %Save simulation results:
@@ -1968,106 +2103,14 @@ data.t2 =  t2;
 data.POS_TX2 = POS_TX2;
 data.POS_RX2 = POS_RX2;
 
+data.Range_TX = Range_TX;
+data.Range_RX = Range_RX;
+data.Bi_Range = Bi_Range;
+
+data.RRange_TX = RRange_TX;
+data.RRange_RX = RRange_RX;
+data.Bi_RRange = Bi_RRange;
 
 %save the output
 save(dataFileName, '-struct', 'data');
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% figure;
-% subplot(221);
-% imagesc(x_psf,y_psf,20*log10(abs(psf)),[-60 0]);
-% axis equal xy tight;
-% colorbar;colormap jet;
-% hold on;
-% scale_c = .75*max(x_psf);
-% quiver(0,0,scale_c*R_vec(1),scale_c*R_vec(2),'Color','r');
-% quiver(0,0,scale_c*XR_vec(1),scale_c*XR_vec(2),'Color','r');
-% quiver(0,0,scale_c*XD_vec(1),scale_c*XD_vec(2),'Color','c');
-% 
-% 
-% subplot(222);
-% imagesc(x_psf,y_psf,20*log10(abs(psf_taylor)),[-60 0]);
-% axis equal xy tight;
-% colorbar;colormap jet;
-% 
-% hold on;
-% scale_c = .75*max(x_psf);
-% quiver(0,0,scale_c*R_vec(1),scale_c*R_vec(2),'Color','r');
-% quiver(0,0,scale_c*XR_vec(1),scale_c*XR_vec(2),'Color','r');
-% quiver(0,0,scale_c*XD_vec(1),scale_c*XD_vec(2),'Color','c');
-% 
-% 
-% subplot(223);
-% imagesc(x_psf,y_psf,20*log10(abs(psf_fm)),[-60 0]);
-% axis equal xy tight;colorbar;colormap jet;
-% hold on;
-% scale_c = .75*max(x_psf);
-% quiver(0,0,scale_c*R_fm_vec(1),scale_c*R_fm_vec(2),'Color','r');
-% quiver(0,0,scale_c*XR_fm_vec(1),scale_c*XR_fm_vec(2),'Color','r');
-% quiver(0,0,scale_c*XD_fm_vec(1),scale_c*XD_fm_vec(2),'Color','c');
-% 
-% % quiver(0,0,scale_c*x_temp(1),scale_c*x_temp(2),'Color','c');
-% 
-% subplot(224);
-% imagesc(x_psf,y_psf,20*log10(abs(psf_fm_taylor)),[-60 0]);
-% axis equal xy tight;colorbar;colormap jet;
-% 
-% hold on;
-% scale_c = .75*max(x_psf);
-% quiver(0,0,scale_c*R_fm_vec(1),scale_c*R_fm_vec(2),'Color','r');
-% quiver(0,0,scale_c*XR_fm_vec(1),scale_c*XR_fm_vec(2),'Color','r');
-% quiver(0,0,scale_c*XD_fm_vec(1),scale_c*XD_fm_vec(2),'Color','c');
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% figure;
-% subplot(221);imagesc(x_psf,y_psf,20*log10(abs(ipr)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-% subplot(222);imagesc(x_psf,y_psf,20*log10(abs(ipr_taylor)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-% subplot(223);imagesc(x_psf,y_psf,20*log10(abs(ipr_fm)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-% subplot(224);imagesc(x_psf,y_psf,20*log10(abs(ipr_fm_taylor)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% figure;
-% subplot(221);imagesc(x,y,20*log10(abs(sar)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-% subplot(222);imagesc(x,y,20*log10(abs(sar_taylor)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-% subplot(223);imagesc(x,y,20*log10(abs(sar_fm)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-% subplot(224);imagesc(x,y,20*log10(abs(sar_fm_taylor)),[-60 0]);axis equal xy tight;colorbar;colormap jet;
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-% x1 = [F_x(1:end,1).' F_x(end,1:end) F_x(end:-1:1,end).' F_x(1,end:-1:1)];
-% y1 = [F_y(1:end,1).' F_y(end,1:end) F_y(end:-1:1,end).' F_y(1,end:-1:1)];
-% 
-% x2 = [G_x(1:end,1).' G_x(end,1:end) G_x(end:-1:1,end).' G_x(1,end:-1:1)];
-% y2 = [G_y(1:end,1).' G_y(end,1:end) G_y(end:-1:1,end).' G_y(1,end:-1:1)];
-% 
-% figure; hold on
-% axis equal; grid on
-% 
-% % First polygon, red with 50% alpha
-% fill(x1,y1,[1 0 0],'FaceAlpha',0.5,'EdgeColor','k')
-% 
-% % Second polygon, blue with 50% alpha
-% fill(x2,y2,[0 0 1],'FaceAlpha',0.5,'EdgeColor','k')
-% 
-% title('Overlapping transparent surfaces')
-% 
-% 
-% 
-% figure;
-% h1 = fplot3_compat(@(t) POS_fun_TX_x(t),@(t) POS_fun_TX_y(t),@(t) POS_fun_TX_z(t),[t_min t_max]);
-% hold on;
-% TX_color = get(h1,'Color');
-% plot3(POS_fun_TX_x(t_min),POS_fun_TX_y(t_min),POS_fun_TX_z(t_min),'s','Color',TX_color);
-% plot3(POS_fun_TX_x(t_max),POS_fun_TX_y(t_max),POS_fun_TX_z(t_max),'^','Color',TX_color);
-% 
-% h2 = fplot3_compat(@(t) POS_fun_RX_x(t),@(t) POS_fun_RX_y(t),@(t) POS_fun_RX_z(t),[t_min t_max]);
-% RX_color = get(h2,'Color');
-% plot3(POS_fun_RX_x(t_min),POS_fun_RX_y(t_min),POS_fun_RX_z(t_min),'s','Color',RX_color);
-% plot3(POS_fun_RX_x(t_max),POS_fun_RX_y(t_max),POS_fun_RX_z(t_max),'^','Color',RX_color);
-% 
-% plot3(0,0,0,'.k');
-% axis equal;
-% 
-% display('Flight Paths');
-% 
-% 
-% 
