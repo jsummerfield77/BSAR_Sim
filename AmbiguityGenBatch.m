@@ -1,17 +1,43 @@
 % AmbiguityGenBatch.m
 % Author: John Summerfield
-% Note: this is an updated version of the simulation I developed during my
-% PhD studies at UMass Dartmouth.  I'm just trying to get all of the
-% flightpath types that I have worked with into a single simulation.  I'm 
-% only going to simulate point targets.  Also this is a move-stop-move 
-% model. I'm going to use a stepped FM waveform in this model.  We can 
-% manipulate the frequency steps and add a weighting function that varies
-% with frequency steps and slow-time steps.
-%Flight Paths:
-%I'm going to do two types of flight paths for this simulation set, const
-%velocity straight and level, const altitude circular flight paths, conical
-%log-spiral (constant squint), and direct constant zero or pi squint 
-% (landing profile).
+%
+% Note: This is an updated version of the bistatic SAR simulation I originally 
+% developed during my Ph.D. studies at UMass Dartmouth. The current version 
+% modernizes the underlying physics from a traditional move–stop–move model 
+% to a constant fast-time velocity model, which more accurately represents 
+% high-speed platform dynamics and continuous motion effects.
+%
+% Physics Model:
+% Instead of assuming the radar platform stops during each pulse (move–stop–move), 
+% this version assumes constant velocity motion throughout the pulse duration. 
+% At any given moment in slow time, the scattering signal from each point target 
+% in the scene is modeled as a Doppler-time scaled and fast-time delayed signal:
+%
+%   • Doppler-time scaling factor:  η = (c + RR) / (c - RR)
+%   • Fast-time delay:              delay = Bistatic_Range / c
+%
+% where RR is the bistatic range rate and Bistatic_Range is the instantaneous 
+% bistatic distance from transmitter to target to receiver. This formulation 
+% captures the continuous Doppler evolution induced by platform motion and is 
+% valid even at high platform velocities.
+%
+% High-Speed Regime:
+% The simulation is designed for high-velocity platforms on the order of 
+% 800 km/s, representative of spaceborne or hypersonic collection geometries. 
+% The constant velocity model ensures Doppler effects and time scaling are 
+% accurately represented in these regimes.
+%
+% Simulation Scope:
+% This simulation focuses exclusively on point targets. It uses a stepped-FM 
+% waveform with configurable frequency steps and an optional weighting function 
+% that can vary with both frequency and slow-time steps. 
+%
+% Flight Paths:
+% Multiple flight path geometries are supported, including:
+%   – Constant-velocity straight and level
+%   – Constant-altitude circular
+%   – Conical log-spiral (constant squint)
+%   – Direct constant squint (0 or π) landing profiles
 
 % I'm deleting all of the CUDA Parallel Thread Execution (PTX) files
 % Type: Text-based assembly-like code (not binary).
@@ -61,14 +87,14 @@ RX_squint_ang_deg_vec   = [40 90 30 0 10 20];
 %Subsonic - 100 mps (Airborne stuff for this round)
 %I'm using a move-stop-move model here
 %I'm going to make a updated version for higher speed later
-TX_speed_mps_vec = [100 100 100 100 100 100];
-RX_speed_mps_vec = [100 100 100 100 100 100];
+TX_speed_mps_vec = [1 1 1 1 1 1 ]*800e3; %800km/sec 
+RX_speed_mps_vec = [1 1 1 1 1 1 ]*600e3; %600km/sec
 
 TX_el_ang_deg_vec   = [15 15 15 15 5 15]; 
 RX_el_ang_deg_vec   = [30 30 30 30 5 30]; 
 
-TX_range_m_vec   = [20 20 20 20 10 20]*1e3; 
-RX_range_m_vec   = [8 8 8 8 10 8]*1e3; 
+TX_range_m_vec   = [1 1 1 1 .5 1]*700e3; 
+RX_range_m_vec   = [1 1 1 1 .5 1]*500e3; 
 
 %I'm going to do a difference in bearing to scene center rather than a
 %true bistatic angle (slant plane bistatic angle).  The difference in
@@ -124,6 +150,8 @@ end
 
 
 for ii= 1:length(TX_path_type_vec),
+% for ii= 1:3,
+% for ii= 4:6,
     %build a parmeter set
     parms.tgt = tgt;
     parms.TX_path_type = TX_path_type_vec(ii);
