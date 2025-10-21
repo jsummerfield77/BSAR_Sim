@@ -1,6 +1,103 @@
 % GenPlots.m
 % Author: John Summerfield
-% This will generate some plots of the bistatci SAR simulation
+%
+% Description:
+% Generates a comprehensive figure set summarizing the bistatic SAR simulation
+% results under the Constant Fast-time Velocity (CFV) model. The plots include:
+%   • Platform geometry and flight paths
+%   • LOS angles and gradient magnitudes vs. slow time
+%   • K-space transfer-function (TF) passbands (analytical and via FFT)
+%   • Modulation vectors overlaid on TF support (time and frequency components)
+%   • Impulse Responses (IPRs) and Point Spread Functions (PSFs) (baseline, AM, Taylor)
+%   • Matched-filter SAR images (baseline, AF/FM, AM, AM+AF, Taylor variants)
+%
+% Model Update (MSM → CFV):
+% This plotting utility accompanies the simulation update from the
+% move–stop–move (MSM) approximation to the CFV formulation, where Doppler-time
+% scaling η(t, r) = (c + Ṙ) / (c − Ṙ) is used throughout the pipeline. The
+% displayed TF shapes, modulation vectors, IPRs, PSFs, and formed SAR images
+% therefore reflect η-weighted ranges/gradients and are accurate for high-speed
+% platform motion.
+%
+% Inputs:
+%   • Profile_filenames: cell array of scenario base names; for each name, a
+%     precomputed MAT file "<name>.mat" is loaded into profile(ii).dataset.
+%     Each dataset is expected to contain:
+%       - POS_TX, POS_RX, POS_TX2, POS_RX2   : platform position histories
+%       - LOS_TX, LOS_RX, d_LOS_TX, d_LOS_RX : LOS unit vectors and time-derivatives
+%       - RGrad, RGrad_GP, RRGrad, RRGrad_GP : ∇R and ∇Ṙ (full and ground-plane)
+%       - F_r, F_xr, weight_F, taylorwin_2D_F, AVG_F, R_vec, XR_vec
+%       - G_r, G_xr, weight_G, taylorwin_2D_G, AVG_G, R_fm_vec, XR_fm_vec
+%       - Ft_*, Ff_*, Gt_*, Gf_*             : modulation vectors (slow-time/freq)
+%       - ipr, ipr_am, ipr_taylor, ipr_fm, ipr_amfm, ipr_fm_taylor
+%       - psf, psf_am, psf_taylor, psf_fm, psf_amfm, psf_fm_taylor
+%       - sar, sar_am, sar_taylor, sar_fm, sar_amfm, sar_fm_taylor
+%       - r_psf, xr_psf, r, xr, t, freq, BW_R, BW_XR, BW_R_fm, BW_XR_fm
+%
+% What gets plotted & exported (PNG @ 300 dpi):
+%   1) Geometry_FlightPaths.png
+%      - TX/RX paths (km), start/end markers, scene center; axis equal.
+%
+%   2) Geometry_LOS_angles_RRGrad_Mag.png
+%      - TX/RX/∇R azimuth & elevation vs time; |LOS×ẑ| and |(∇Ṙ)×ẑ| magnitudes.
+%
+%   3) KSpace_TF.png
+%      - |TF(K)| from 1./weight_F
+%      - |TF_AM(K)| (flat AM baseline)
+%      - |TF_Taylor(K)| (Taylor-windowed)
+%
+%   4) KSpace_AF_TF.png
+%      - |TF_AF(K)| from 1./weight_G (FM/agile-frequency shaping)
+%      - |TF_AF,AM(K)| (flat AM baseline)
+%      - |TF_AF,Taylor(K)| (Taylor-windowed)
+%
+%   5) TFs_from_FFTs.png
+%      - |TF(K)|, |TF_AM(K)|, |TF_Taylor(K)| via 2-D FFT of IPR variants
+%      - Baseband phasor removal uses AVG_F·{R_vec, XR_vec} to stabilize axes.
+%
+%   6) TFs_AF_from_FFTs.png
+%      - |TF_fm(K)|, |TF_AF,AM(K)|, |TF_AF,Taylor(K)| via 2-D FFT of AF IPRs
+%      - Baseband phasor removal uses AVG_G·{R_fm_vec, XR_fm_vec}.
+%
+%   7) K_Space_Vecs.png
+%      - TF support boundary fill (F and G domains)
+%      - Overlaid modulation vectors: Ft (magenta), Ff (blue) and Gt/Gf analogs
+%      - Vectors downsampled by N_skeep_t, N_skeep_f and scaled by BW terms.
+%
+%   8) IPRs.png and IPRs_AF.png
+%      - |ipr(r)|, |ipr_AM(r)|, |ipr_Taylor(r)| and AF counterparts in dB.
+%      - `ipr_scale` < 1 zooms into mainlobe/first sidelobes for metric reads.
+%
+%   9) PSFs.png and PSFs_AF.png
+%      - |psf(O−r/2, O+r/2)| and AM/Taylor/AF variants in dB; symmetric r-pair.
+%
+%  10) SAR.png and SAR_AF.png
+%      - |ρ̃(r)| images (baseline/AM/Taylor and AF/AM+AF/Taylor variants) in dB.
+%
+% Key CFV Notes (what you will see in the figures):
+%   • K-space passbands reflect η-weighted range/gradient physics; AF panels show
+%     reshaping due to frequency agility (FM) design.
+%   • Modulation vectors (time/frequency) visualize local TF slope/orientation
+%     driven by ∇R, ∇Ṙ, and bandwidth schedules under CFV.
+%   • IPR/PSF mainlobe widths and sidelobe structures are consistent with CFV-based
+%     sampling and weighting; dB scales standardized to [−60, 0] for comparisons.
+%
+% Usage & Options:
+%   • Set `Profile_filenames` to select scenarios; ensure corresponding .mat exist.
+%   • Adjust `outputPath` to control export directory (auto-created if absent).
+%   • Tune `ipr_scale` (0<ipr_scale≤1) to zoom into mainlobe/sidelobes for metric
+%     extraction and visual clarity.
+%   • Axes use SI units (m, rad/m) unless labeled (km for geometry, degrees for
+%     angles). LaTeX interpreter enabled for symbols.
+%
+% Performance:
+%   • Figures are created fullscreen for maximum resolution and saved at 300 dpi.
+%   • Heavy plots (FFT-derived TFs) assume precomputed datasets to avoid recompute.
+%
+% Assumptions:
+%   • Datasets were generated with the CFV model (η = (c+Ṙ)/(c−Ṙ)) and consistent
+%     sampling (slow-time/frequency) meeting Nyquist criteria from the main
+%     simulation scripts.
 
 close all;
 clear all;
